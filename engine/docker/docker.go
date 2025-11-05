@@ -12,15 +12,15 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"github.com/samber/lo"
 )
 
 type Engine struct {
-	client     *client.Client
-	cfg        *Config
-	logsWriter io.Writer
+	client *client.Client
+	cfg    *Config
 }
 
-func New(cfg *Config, writer io.Writer) (*Engine, error) {
+func New(cfg *Config) (*Engine, error) {
 	opts := []client.Opt{client.FromEnv}
 	if cfg != nil && cfg.Host != "" {
 		opts = append(opts, client.WithHost(cfg.Host))
@@ -33,53 +33,43 @@ func New(cfg *Config, writer io.Writer) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{client: c, cfg: cfg, logsWriter: writer}, nil
+
+	return &Engine{
+		client: c,
+		cfg:    cfg,
+	}, nil
 }
 
-func (d *Engine) Create(ctx context.Context, image string) (string, error) {
-	if d.cfg == nil {
-		d.cfg = &Config{}
-	}
-
+func (d *Engine) Create(ctx context.Context, image string) (*string, error) {
 	pullPolicy := strings.ToLower(d.cfg.PullPolicy)
 	if pullPolicy == "always" || pullPolicy == "ifnotpresent" || pullPolicy == "if-not-present" {
 		if err := d.ensureImage(ctx, image, pullPolicy); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 
 	containerCfg, hostCfg, netCfg, name, err := d.buildContainerConfigs(image)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	resp, err := d.client.ContainerCreate(ctx, containerCfg, hostCfg, netCfg, nil, name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if err := d.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return "", err
+		return nil, err
 	}
-	return resp.ID, nil
+
+	return &resp.ID, nil
 }
 
 func (d *Engine) Remove(ctx context.Context, id string) error {
-	return d.client.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
-}
-
-func (d *Engine) Update(ctx context.Context, id string) error {
-	if d.cfg == nil {
-		return nil
-	}
-	resources := container.Resources{
-		Memory:    d.cfg.DefaultContainer.Resources.MemoryBytes,
-		NanoCPUs:  d.cfg.DefaultContainer.Resources.NanoCPUs,
-		CPUPeriod: d.cfg.DefaultContainer.Resources.CPUPeriod,
-		CPUQuota:  d.cfg.DefaultContainer.Resources.CPUQuota,
-	}
-	_, err := d.client.ContainerUpdate(ctx, id, container.UpdateConfig{Resources: resources})
-	return err
+	return d.client.ContainerRemove(ctx, id, container.RemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	})
 }
 
 func (d *Engine) ensureImage(ctx context.Context, image, policy string) error {
@@ -89,11 +79,7 @@ func (d *Engine) ensureImage(ctx context.Context, image, policy string) error {
 			return err
 		}
 		defer rc.Close()
-		if d.logsWriter != nil {
-			_, _ = io.Copy(d.logsWriter, rc)
-		} else {
-			_, _ = io.Copy(io.Discard, rc)
-		}
+		_, _ = io.Copy(io.Discard, rc)
 		return nil
 	}
 
@@ -101,23 +87,17 @@ func (d *Engine) ensureImage(ctx context.Context, image, policy string) error {
 	if err != nil {
 		return err
 	}
-	for _, img := range imgs {
-		for _, tag := range img.RepoTags {
-			if tag == image {
-				return nil
-			}
-		}
+	if lo.ContainsBy(imgs, func(img typesimage.Summary) bool {
+		return lo.Contains(img.RepoTags, image)
+	}) {
+		return nil
 	}
 	rc, err := d.client.ImagePull(ctx, image, typesimage.PullOptions{})
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	if d.logsWriter != nil {
-		_, _ = io.Copy(d.logsWriter, rc)
-	} else {
-		_, _ = io.Copy(io.Discard, rc)
-	}
+	_, _ = io.Copy(io.Discard, rc)
 	return nil
 }
 
